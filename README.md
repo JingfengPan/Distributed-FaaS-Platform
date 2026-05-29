@@ -1,22 +1,44 @@
 # Distributed Function-as-a-Service Platform
 
-A distributed Function-as-a-Service (FaaS) platform built with Python, FastAPI, Redis, and ZeroMQ. The system lets clients register Python functions, submit serialized function invocations, execute those tasks through one of several dispatcher modes, and retrieve task status or results through a REST API.
+A distributed Function-as-a-Service (FaaS) platform built with **Python, FastAPI, Redis, ZeroMQ, Dill, and multiprocessing**. The system lets clients register Python functions, submit asynchronous invocations through REST APIs, track task status, and retrieve serialized results.
 
-This project was developed for MPCS 52040 Distributed Systems and demonstrates local multiprocessing, worker-driven scheduling, dispatcher-driven scheduling, Redis-backed task state, and heartbeat-based fault tolerance.
+The platform supports three execution modes—**Local**, **Pull**, and **Push**—to compare different scheduling models. Redis stores registered functions, task metadata, status transitions, results, worker heartbeats, and task notifications. ZeroMQ coordinates communication between the dispatcher and distributed workers, while heartbeat monitoring and task re-queuing provide basic failure recovery.
 
-## Features
+> Built for MPCS 52040 Distributed Systems.
 
-- **Function registration and invocation** through a FastAPI web service.
+---
+
+## Highlights
+
+- **Python function registration** through a FastAPI REST service.
+- **Asynchronous invocation** with task IDs returned immediately after submission.
+- **Task status tracking** through Redis-backed state transitions.
+- **Serialized result retrieval** using Dill and base64 encoding.
 - **Three execution modes**:
-  - **Local mode**: the dispatcher executes tasks using a local multiprocessing pool.
-  - **Pull mode**: workers repeatedly request tasks from the dispatcher.
-  - **Push mode**: workers register with the dispatcher, and the dispatcher assigns tasks to them.
-- **Redis-backed storage** for functions, tasks, status transitions, task results, worker heartbeats, and task notifications.
-- **ZeroMQ communication** between the dispatcher and distributed workers.
-- **Fault tolerance** through worker heartbeat monitoring and task re-queuing when workers fail.
-- **Dill-based serialization** for Python functions, arguments, return values, and exceptions.
-- **Benchmark tooling** for weak-scaling experiments, throughput measurement, latency measurement, and visualization.
-- **Automated tests** for API behavior, dispatcher-worker integration, state transitions, concurrent execution, and failure recovery.
+  - **Local mode** — dispatcher executes tasks with a local multiprocessing pool.
+  - **Pull mode** — workers request tasks from the dispatcher when ready.
+  - **Push mode** — dispatcher assigns queued tasks to registered workers.
+- **ZeroMQ-based worker-dispatcher coordination** using REQ/REP for Pull mode and ROUTER/DEALER for Push mode.
+- **Heartbeat-based failure detection** for worker liveness monitoring.
+- **Task re-queuing** when a worker fails before completing assigned work.
+- **Benchmark tooling** for throughput, latency, weak-scaling, and execution-mode comparisons.
+- **Pytest coverage** for API behavior, state transitions, dispatcher-worker integration, concurrency, and recovery behavior.
+
+---
+
+## Tech Stack
+
+| Category | Technologies | Role |
+|---|---|---|
+| Web API | FastAPI, Uvicorn, REST APIs | Exposes function registration, task invocation, status polling, and result retrieval endpoints |
+| State store | Redis | Stores function payloads, task metadata, task status, results, worker heartbeats, and task notifications |
+| Messaging / coordination | Redis Pub/Sub, ZeroMQ | Redis notifies the dispatcher of new tasks; ZeroMQ coordinates dispatcher-worker communication |
+| Serialization | Dill, base64 | Serializes Python functions, arguments, return values, and exceptions |
+| Execution | multiprocessing, worker pools | Executes tasks locally or inside worker-side process/thread pools |
+| Testing | pytest | Validates API behavior, dispatcher/worker flows, concurrency, and fault recovery |
+| Benchmarking | requests, pandas, matplotlib | Measures latency, throughput, and scaling behavior across execution modes |
+
+---
 
 ## Architecture
 
@@ -37,35 +59,98 @@ flowchart LR
 
 ### Component Responsibilities
 
-- `service/main.py` exposes the REST API.
-- `service/redis_client.py` stores registered functions and task metadata in Redis.
-- `service/serialize.py` serializes and deserializes Python objects using `dill` and base64.
-- `task_dispatcher.py` listens for new tasks and dispatches work in local, pull, or push mode.
-- `worker_pool/pull_worker.py` requests tasks from a pull-mode dispatcher.
-- `worker_pool/push_worker.py` registers with a push-mode dispatcher and waits for assigned tasks.
-- `worker_pool/executor.py` deserializes functions and parameters, executes the function, and serializes the result.
-- `benchmark/performance_client.py` runs benchmark sweeps across execution modes.
-- `benchmark/plot_results.py` creates plots from benchmark CSV output.
+| Component | Responsibility |
+|---|---|
+| `service/main.py` | Defines REST endpoints for registering functions, submitting tasks, checking status, and retrieving results |
+| `service/redis_client.py` | Stores registered functions, task records, statuses, results, worker heartbeats, and task notifications in Redis |
+| `service/serialize.py` | Serializes and deserializes Python objects using Dill and base64 |
+| `task_dispatcher.py` | Subscribes to new-task notifications and dispatches tasks in Local, Pull, or Push mode |
+| `worker_pool/pull_worker.py` | Pull-mode worker that requests tasks from the dispatcher |
+| `worker_pool/push_worker.py` | Push-mode worker that registers with the dispatcher and waits for assigned tasks |
+| `worker_pool/executor.py` | Deserializes function payloads, executes functions, and serializes outputs or exceptions |
+| `benchmark/performance_client.py` | Runs benchmark sweeps across execution modes, worker counts, and test functions |
+| `benchmark/plot_results.py` | Generates benchmark plots from CSV output |
+
+---
 
 ## Execution Modes
 
 ### Local Mode
 
-Local mode is the simplest execution mode. The dispatcher subscribes to the Redis task channel and executes tasks using a local process pool.
+Local mode runs tasks inside the dispatcher process using a local multiprocessing pool.
 
-Use this mode when you want to test the API, Redis integration, serialization, and task lifecycle without running separate worker processes.
+Use this mode to test the FastAPI service, Redis task state, serialization logic, and task lifecycle without launching separate workers.
+
+```bash
+python task_dispatcher.py -m local -w 4
+```
 
 ### Pull Mode
 
-Pull mode uses a ZeroMQ `REP` socket in the dispatcher and `REQ` sockets in workers. Workers send `REQUEST_TASK` messages, receive a task when one is available, execute it, and send the result back to the dispatcher.
+Pull mode uses a ZeroMQ `REP` socket in the dispatcher and `REQ` sockets in workers. Workers repeatedly send `REQUEST_TASK` messages, receive a task when available, execute it, and return the result.
 
-This mode is worker-driven and works well when workers should control when they accept more work.
+This mode is worker-driven: workers control when they request more work.
+
+```bash
+python task_dispatcher.py -m pull -p 5001
+python -m worker_pool.pull_worker -H localhost -p 5001 -w 2
+```
 
 ### Push Mode
 
-Push mode uses a ZeroMQ `ROUTER` socket in the dispatcher and `DEALER` sockets in workers. Workers register with the dispatcher, and the dispatcher assigns queued tasks to known workers in round-robin order.
+Push mode uses a ZeroMQ `ROUTER` socket in the dispatcher and `DEALER` sockets in workers. Workers register with the dispatcher, and the dispatcher assigns queued tasks to registered workers in round-robin order.
 
-This mode is dispatcher-driven and is useful for comparing centralized scheduling behavior against pull-based scheduling.
+This mode is dispatcher-driven and is useful for comparing centralized scheduling against pull-based scheduling.
+
+```bash
+python task_dispatcher.py -m push -p 5002
+python -m worker_pool.push_worker -H localhost -p 5002 -w 2
+```
+
+---
+
+## Task Lifecycle
+
+Tasks move through the following states:
+
+```text
+QUEUED -> RUNNING -> COMPLETED
+QUEUED -> RUNNING -> FAILED
+```
+
+When a task is created:
+
+1. The FastAPI service validates the request.
+2. The task is stored in Redis with status `QUEUED`.
+3. The task ID is published to the Redis `tasks` channel.
+4. The dispatcher receives the task ID and assigns or starts execution.
+5. The task is marked `RUNNING`.
+6. The executor deserializes the function and arguments, runs the function, and serializes the output.
+7. Redis is updated with either a `COMPLETED` result or a `FAILED` exception payload.
+8. The client polls `/status/{task_id}` or `/result/{task_id}` to retrieve the final state.
+
+---
+
+## Fault Tolerance
+
+Workers write heartbeat timestamps to Redis under the `worker_heartbeats` hash. The dispatcher periodically checks these heartbeats and treats workers as dead if they have not updated their heartbeat within the configured timeout.
+
+When a worker is considered dead:
+
+1. The dispatcher finds tasks assigned to that worker.
+2. Those tasks are moved back to `QUEUED`.
+3. Task IDs are re-published to the Redis task channel.
+4. Dead-worker heartbeat and assignment metadata are removed.
+
+The heartbeat timeout is configured in `task_dispatcher.py`:
+
+```python
+HEARTBEAT_TIMEOUT = 3
+```
+
+This provides basic failure recovery for interrupted worker execution. It is suitable for a distributed-systems project prototype, but it is not intended to be a production-grade fault-tolerance mechanism with full resource isolation, retry policies, or exactly-once execution guarantees.
+
+---
 
 ## Prerequisites
 
@@ -82,13 +167,15 @@ localhost:6379
 
 The current Redis connection settings are defined in `service/redis_client.py`.
 
+---
+
 ## Installation
 
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repository-url>
-cd <project-directory>
+git clone https://github.com/JingfengPan/Distributed-FaaS-Platform.git
+cd Distributed-FaaS-Platform
 ```
 
 ### 2. Create a Python Environment
@@ -106,13 +193,13 @@ Using `venv`:
 python -m venv .venv
 ```
 
-On PowerShell:
+PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-On Linux, macOS, or WSL2:
+Linux, macOS, or WSL2:
 
 ```bash
 source .venv/bin/activate
@@ -120,13 +207,11 @@ source .venv/bin/activate
 
 ### 3. Install Python Dependencies
 
-Install the runtime and test dependencies:
-
 ```bash
 pip install fastapi uvicorn redis dill pyzmq pydantic requests pytest pandas matplotlib numpy
 ```
 
-If you later add a `requirements.txt`, the equivalent setup command is:
+If a `requirements.txt` file is added later, use:
 
 ```bash
 pip install -r requirements.txt
@@ -134,7 +219,7 @@ pip install -r requirements.txt
 
 ### 4. Install and Start Redis
 
-On Ubuntu, Debian, or WSL2:
+Ubuntu, Debian, or WSL2:
 
 ```bash
 sudo apt update
@@ -142,7 +227,7 @@ sudo apt install redis-server
 sudo service redis-server start
 ```
 
-On macOS with Homebrew:
+macOS with Homebrew:
 
 ```bash
 brew install redis
@@ -167,6 +252,8 @@ Expected output:
 ```text
 PONG
 ```
+
+---
 
 ## Quick Start
 
@@ -215,8 +302,6 @@ http://127.0.0.1:8000/docs
 
 ### 3. Start a Dispatcher
 
-Choose one execution mode.
-
 Local mode:
 
 ```bash
@@ -237,7 +322,7 @@ python task_dispatcher.py -m push -p 5002
 
 ### 4. Start Workers
 
-Workers are only needed for pull and push modes.
+Workers are only needed for Pull and Push modes.
 
 Pull worker:
 
@@ -251,7 +336,9 @@ Push worker:
 python -m worker_pool.push_worker -H localhost -p 5002 -w 2
 ```
 
-You can start multiple worker processes in separate terminals to increase worker capacity.
+You can start multiple worker processes in separate terminals to increase capacity.
+
+---
 
 ## API Usage
 
@@ -320,6 +407,8 @@ Expected output:
 ```text
 42
 ```
+
+---
 
 ## API Reference
 
@@ -392,33 +481,7 @@ Response body:
 }
 ```
 
-## Task Lifecycle
-
-Tasks move through the following states:
-
-```text
-QUEUED -> RUNNING -> COMPLETED
-QUEUED -> RUNNING -> FAILED
-```
-
-When a task is created, it is stored in Redis and published to the Redis `tasks` channel. The dispatcher receives the task ID, marks the task as running when it assigns or starts execution, and stores the serialized result or serialized exception when execution finishes.
-
-## Fault Tolerance
-
-Workers write heartbeat timestamps to Redis under the `worker_heartbeats` hash. The dispatcher checks heartbeats and treats workers as dead if they have not updated their heartbeat within the configured timeout.
-
-When a worker is considered dead:
-
-1. The dispatcher finds tasks assigned to that worker.
-2. Those tasks are moved back to `QUEUED`.
-3. The task IDs are re-published to the Redis task channel.
-4. The dead worker's heartbeat and assignment metadata are removed.
-
-The heartbeat timeout is configured in `task_dispatcher.py`:
-
-```python
-HEARTBEAT_TIMEOUT = 3
-```
+---
 
 ## Running Tests
 
@@ -426,7 +489,7 @@ HEARTBEAT_TIMEOUT = 3
 
 Start Redis, the FastAPI service, and a dispatcher before running end-to-end web service tests.
 
-Example with local mode:
+Example with Local mode:
 
 ```bash
 redis-server
@@ -466,6 +529,8 @@ If tests behave inconsistently after manual runs, clear Redis before retrying:
 redis-cli FLUSHDB
 ```
 
+---
+
 ## Benchmarking
 
 The benchmark client registers test functions, starts each execution mode, submits tasks, measures latency and throughput, and writes results to CSV.
@@ -504,6 +569,8 @@ Generated plots include:
 - `benchmark/function_comparison.png`
 - `benchmark/weak_scaling_throughput.png`
 
+---
+
 ## Project Structure
 
 ```text
@@ -524,8 +591,10 @@ Generated plots include:
 │   ├── executor.py              # Function execution helper
 │   ├── pull_worker.py           # Pull-mode worker
 │   └── push_worker.py           # Push-mode worker
-└── task_dispatcher.py           # Local, pull, and push dispatchers
+└── task_dispatcher.py           # Local, Pull, and Push dispatchers
 ```
+
+---
 
 ## Troubleshooting
 
@@ -575,7 +644,7 @@ Default ports used by this project:
 - Pull dispatcher: `5001`
 - Push dispatcher: `5002`
 
-On Linux, macOS, or WSL2:
+Linux, macOS, or WSL2:
 
 ```bash
 lsof -i :8000
@@ -583,7 +652,7 @@ lsof -i :5001
 lsof -i :5002
 ```
 
-On PowerShell:
+PowerShell:
 
 ```powershell
 netstat -ano | findstr :8000
@@ -598,21 +667,21 @@ Check the following:
 - Redis is running and reachable at `localhost:6379`.
 - The dispatcher was started before the workers.
 - The worker mode matches the dispatcher mode.
-- Pull workers connect to the pull dispatcher port.
-- Push workers connect to the push dispatcher port.
+- Pull workers connect to the Pull dispatcher port.
+- Push workers connect to the Push dispatcher port.
 - Redis does not contain stale state from a previous run.
 
 ### Tasks Stay Queued
 
 This usually means no dispatcher is subscribed to the Redis task channel or no workers are available for the selected mode.
 
-For local mode, confirm the dispatcher is running:
+For Local mode, confirm the dispatcher is running:
 
 ```bash
 python task_dispatcher.py -m local -w 4
 ```
 
-For pull or push mode, confirm both dispatcher and workers are running.
+For Pull or Push mode, confirm both dispatcher and workers are running.
 
 ### Clean Shutdown
 
@@ -629,14 +698,19 @@ Optional Redis shutdown:
 redis-cli shutdown
 ```
 
+---
+
 ## Development Notes
 
-- Functions and arguments must be serializable by `dill`.
+- Functions and arguments must be serializable by Dill.
 - Function argument payloads must serialize `(args, kwargs)`.
 - Results and exceptions are serialized before being stored in Redis.
 - Worker processes use a process pool on Unix-like systems and a thread-backed pool on Windows.
 - Redis state is not automatically cleared between manual runs.
 - The benchmark script starts and stops dispatchers and workers, but it expects Redis and the FastAPI service to already be available.
+- Before presenting the repository publicly, remove generated files such as `__pycache__/`, `.pytest_cache/`, and local Redis dump files such as `dump.rdb` from version control if they are present.
+
+---
 
 ## License
 
